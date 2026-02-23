@@ -1,6 +1,6 @@
 # PRD: AlphaLab — Automated Trading Research Platform
 
-**Version:** 1.2 (Python-only)  
+**Version:** 1.3 (Python-only, CPU-first, Apple M4)  
 **Date:** 2026-02-23  
 **Status:** Approved — Ready for Implementation  
 **Author:** [Owner]
@@ -43,6 +43,7 @@ AlphaLab — платформа для автоматизированного п
 - Автоматическое исполнение ордеров (auto-trading). Архитектура должна позволить это в будущем, но v1 — research only.
 - Web UI / dashboard (Telegram-бот покрывает все потребности v1).
 - Мультипользовательский режим — система для одного оператора.
+- GPU-зависимые модели (Transformers, full NLP fine-tune) — отложены. CPU-first стратегия.
 
 ---
 
@@ -230,7 +231,7 @@ Binance и Bybit предоставляют практически все нуж
 **Рекомендуемые TG-каналы для мониторинга:** @raborynokda, @cbrstocks, @markettwits, @AK47pfl — можно добавлять/убирать через конфиг.
 
 **NLP Pipeline для Sentiment:**
-RSS, Reddit и Smart-Lab → raw текст → FinBERT для английского, ruBERT (DeepPavlov) для русского → sentiment score [-1.0, 1.0]. Обе модели open-source, бесплатные, запускаются локально на GPU.
+RSS, Reddit и Smart-Lab → raw текст → FinBERT для английского, ruBERT (DeepPavlov) для русского → sentiment score [-1.0, 1.0]. Обе модели open-source, бесплатные, запускаются локально: quantized inference на Apple M4 MPS (быстро) или CPU (чуть медленнее, но достаточно). GPU не требуется для inference.
 
 #### Macro — ОТЛИЧНОЕ покрытие
 
@@ -747,7 +748,7 @@ connectors:
 
 ### 7.2 Feature Engineering Service
 
-**Язык:** Python (pandas, numpy, ta-lib).
+**Язык:** Python (pandas, numpy, ta-lib). Polars опционально для тяжёлых агрегаций (отлично работает на Apple M4 ARM).
 
 Вычисляет фичи из сырых данных для ML-моделей и стратегий. Фичи хранятся в отдельных таблицах TimescaleDB.
 
@@ -939,29 +940,59 @@ class BacktestResult:
 
 ### 7.5 ML Pipeline
 
-**Язык:** Python (PyTorch для deep learning, XGBoost/LightGBM для tabular).
+**Язык:** Python (scikit-learn, XGBoost, LightGBM — CPU; PyTorch MPS — inference на M4).
+
+**Compute Strategy:**
+
+> **CPU-first подход.** Для большинства predicting-алгоритмов (XGBoost, LightGBM, Random Forest, логистическая регрессия, HMM) CPU более чем достаточно — эти модели и так CPU-native и не выигрывают от GPU. GPU в облаке (A100/H100) есть, но использование проблематично (задержки, стоимость, DevOps overhead). Локальная машина — Apple M4, который отлично справляется с inference NLP-моделей через PyTorch MPS backend.
 
 **Архитектура pipeline:**
 
 ```
 Feature Store → Feature Selection → Train/Val/Test Split  
-              → Model Training → Hyperparameter Tuning  
-              → Evaluation → Model Registry → Deployment  
+              → Model Training (CPU) → Hyperparameter Tuning (CPU, Optuna)  
+              → Evaluation → Model Registry → Deployment (local M4)  
               → Monitoring → Retrain Trigger
 ```
 
 **Модели (по приоритету):**
 
-| Model | Use Case | Retraining |
+| Model | Use Case | Compute | Retraining |
+|---|---|---|---|
+| XGBoost / LightGBM | Direction prediction, feature screening | CPU (native, быстро) | Weekly |
+| Random Forest / Extra Trees | Ensemble baseline, feature importance | CPU | Weekly |
+| Logistic Regression + feature crosses | Fast baseline, interpretable signals | CPU (секунды) | Daily |
+| FinBERT (ProsusAI/finbert, quantized) | Sentiment scoring for English news/Reddit | M4 MPS inference; CPU fine-tune | Monthly |
+| ruBERT (DeepPavlov, quantized) | Sentiment scoring for Russian news/Smart-Lab/TG | M4 MPS inference; CPU fine-tune | Monthly |
+| Hidden Markov Model (hmmlearn) | Market regime classification | CPU (native) | Weekly |
+| Isolation Forest | Anomaly detection, regime change | CPU (native) | Daily |
+| LSTM / GRU (small, <1M params) | Sequence patterns, volatility prediction | M4 MPS or CPU | Bi-weekly |
+| Autoencoder (small) | Feature compression, anomaly detection | M4 MPS or CPU | Bi-weekly |
+
+**Отложено до появления стабильного GPU-доступа:**
+
+| Model | Use Case | Why Deferred |
 |---|---|---|
-| XGBoost / LightGBM | Direction prediction, feature screening | Weekly |
-| LSTM / GRU | Sequence patterns, volatility prediction | Weekly |
-| Transformer (small) | Multi-asset attention, cross-market signals | Bi-weekly |
-| FinBERT (ProsusAI/finbert) | Sentiment scoring for English news/Reddit | Monthly (fine-tune) |
-| ruBERT (DeepPavlov) | Sentiment scoring for Russian news/Smart-Lab/TG | Monthly (fine-tune) |
-| Isolation Forest | Anomaly detection, regime change | Daily |
-| Hidden Markov Model | Market regime classification | Weekly |
-| Autoencoder | Feature compression, anomaly detection | Bi-weekly |
+| Transformer (multi-asset attention) | Cross-market signals | Требует GPU для training; inference на M4 возможен для small models |
+| Large NLP fine-tuning | Domain-specific sentiment | Full fine-tune FinBERT/ruBERT требует GPU; quantized inference на CPU/MPS достаточно |
+
+**NLP Inference на Apple M4:**
+
+```python
+import torch
+
+# Apple MPS backend для PyTorch — ускоряет inference NLP-моделей
+device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+
+# Quantized модели для эффективного inference
+from transformers import AutoModelForSequenceClassification
+model = AutoModelForSequenceClassification.from_pretrained(
+    "ProsusAI/finbert", 
+    torch_dtype=torch.float16  # half-precision на M4
+).to(device)
+```
+
+**Важно:** FinBERT и ruBERT для inference (scoring текстов) работают быстро на CPU/MPS. Полный fine-tune — при необходимости разово в облаке, затем inference локально.
 
 **Retraining Logic:**
 
@@ -1081,8 +1112,9 @@ class Signal:
 | **Data Ingestion (polling)** | asyncio + aiohttp | MOEX ISS, Reddit, RSS, Etherscan, FRED, CBR |
 | **API Gateway** | FastAPI | Внутренний API между сервисами |
 | **Backtest Engine** | Custom event-driven (numpy-vectorized) | Критичные циклы через numpy/numba |
-| **ML Pipeline** | PyTorch, XGBoost, LightGBM, scikit-learn | A100/H100 |
-| **NLP / Sentiment** | FinBERT (EN), ruBERT/DeepPavlov (RU) | HuggingFace Transformers |
+| **ML Pipeline** | XGBoost, LightGBM, scikit-learn, hmmlearn | CPU-native, быстро |
+| **Deep Learning (inference)** | PyTorch (MPS backend) | M4 Neural Engine для NLP inference |
+| **NLP / Sentiment** | FinBERT (EN), ruBERT/DeepPavlov (RU) — quantized | HuggingFace Transformers, half-precision |
 | **Feature Engineering** | pandas, numpy, ta-lib | Polars для тяжёлых агрегаций (опционально) |
 | **Telegram Bot** | aiogram 3.x | Async-native |
 | **Message Queue** | Redis Streams | Через redis-py / aioredis |
@@ -1094,7 +1126,7 @@ class Signal:
 | **Containerization** | Docker Compose | Всё Python — единый base image |
 | **Monitoring** | Prometheus client + Grafana (optional v1) | prometheus-client lib |
 
-**Язык: 100% Python.** Весь стек на Python 3.11+ с asyncio. Для performance-критичных участков (бэктест inner loop, feature computation) используем numpy vectorization и Numba JIT вместо Go/Rust. A100/H100 компенсирует остальное.
+**Язык: 100% Python.** Весь стек на Python 3.11+ с asyncio. Для performance-критичных участков (бэктест inner loop, feature computation) используем numpy vectorization и Numba JIT. Compute strategy: CPU-first (XGBoost/LightGBM — CPU-native и быстрые), Apple M4 MPS для NLP inference, cloud GPU — только при крайней необходимости.
 
 ---
 
@@ -1107,7 +1139,7 @@ class Signal:
 | Backtest speed (1 year, 1h candles, 1 symbol) | < 30 seconds |
 | Backtest speed (1 year, 1m candles, 1 symbol) | < 5 minutes |
 | Hypothesis queue throughput | ≥ 50 backtests / hour |
-| ML model retraining time | < 30 min (XGBoost), < 2 hours (Transformer) — A100/H100 |
+| ML model retraining time | < 5 min (XGBoost/LightGBM on CPU), < 30 min (small LSTM on M4 MPS) |
 | Telegram response time | < 3 seconds for commands |
 | Data storage retention | Unlimited (with TimescaleDB compression for data > 6 months) |
 | System uptime | 99% (допустимы maintenance windows) |
@@ -1165,30 +1197,32 @@ class Signal:
 
 **Goal:** Система сама находит идеи.
 
-- [ ] ML pipeline: training, evaluation, model registry.
-- [ ] XGBoost/LightGBM для direction prediction.
+- [ ] ML pipeline: training (CPU), evaluation, model registry.
+- [ ] XGBoost/LightGBM для direction prediction (CPU-native, быстрый retrain).
 - [ ] Statistical scanner (correlation anomalies, cointegration).
 - [ ] Auto-hypothesis generation с pre-screening.
 - [ ] Retraining scheduler (time-based + drift-based).
+- [ ] NLP inference pipeline: quantized FinBERT + ruBERT на M4 MPS (или CPU в Docker).
 - [ ] Signal generation service.
 - [ ] Telegram: `/signals`, `/models`, `/retrain`.
 - [ ] User feedback loop (👍/👎 → model improvement).
 
-**Deliverable:** Автоматическая генерация ≥ 10 гипотез/день, ≥ 3 сигнала/день с confidence > 0.65.
+**Deliverable:** Автоматическая генерация ≥ 10 гипотез/день, ≥ 3 сигнала/день с confidence > 0.65. Все модели работают на CPU/M4 без GPU.
 
-### Phase 5 — Deep Learning + Polish (Weeks 19–24)
+### Phase 5 — Advanced Models + Polish (Weeks 19–24)
 
-**Goal:** Продвинутые модели + оптимизация.
+**Goal:** Продвинутые модели (CPU-compatible) + оптимизация.
 
-- [ ] LSTM/GRU для sequence prediction.
-- [ ] Transformer для multi-asset attention.
-- [ ] Anomaly detection (Isolation Forest, Autoencoders).
-- [ ] Regime detection (HMM).
-- [ ] Prometheus + Grafana monitoring (optional).
+- [ ] Small LSTM/GRU для sequence prediction (M4 MPS inference, CPU training).
+- [ ] Anomaly detection (Isolation Forest, small Autoencoders).
+- [ ] Regime detection (HMM — hmmlearn, CPU-native).
+- [ ] Ensemble methods: stacking XGBoost + LightGBM + LR.
 - [ ] Performance optimization (Numba JIT для backtest hot paths, Polars для тяжёлых агрегаций).
+- [ ] Prometheus + Grafana monitoring (optional).
 - [ ] Comprehensive documentation.
+- [ ] **Deferred (если появится стабильный GPU-доступ):** Transformer для multi-asset attention, full NLP fine-tuning.
 
-**Deliverable:** Полноценная research-платформа с 5+ ML-моделями.
+**Deliverable:** Полноценная research-платформа с 5+ ML-моделями, все работают на CPU/M4.
 
 ---
 
@@ -1206,7 +1240,7 @@ class Signal:
 | Look-ahead bias | Невалидные бэктесты | Medium | Strict point-in-time data access, code review |
 | MOEX trading hours (10:00–18:50 MSK) | Гэпы на открытии, ночной риск | Medium | Gap-aware стратегии; overnight risk модель; учёт в бэктесте |
 | Санкционные риски (брокер/MOEX) | Потеря доступа к торгам | Low | Мониторинг новостей; данные уже в локальной БД |
-| GPU memory limits | Не влезают большие модели | Very Low | A100/H100 (40–80GB VRAM) — достаточно для любых моделей в проекте |
+| Cloud GPU доступ проблематичен | Не обучить большие Transformer-модели | Medium | CPU-first стратегия (XGBoost/LightGBM); quantized NLP inference на M4 MPS; cloud GPU разово для fine-tune если нужно |
 | TimescaleDB performance | Медленные запросы | Low | Proper indexing, compression, continuous aggregates |
 | Telegram API limits | Задержки уведомлений | Low | Message batching, priority queue for alerts |
 
@@ -1220,7 +1254,7 @@ class Signal:
 | Average Data Quality Score | > 80 | > 85 |
 | Data freshness SLA compliance | > 95% | > 99% |
 | Hypotheses tested per week | ≥ 50 | ≥ 200 |
-| ML models in production | 2 | 5+ |
+| ML models in production | 2 (CPU-native) | 5+ (CPU-native + small LSTM on MPS) |
 | Signals generated per day | ≥ 3 | ≥ 10 |
 | Signal precision (user-rated) | > 50% | > 60% |
 | Backtest queue latency (p95) | < 10 min | < 5 min |
@@ -1237,7 +1271,7 @@ class Signal:
 | 1 | Symbols universe (крипта) | Динамический top-50 by volume на Binance. Пересчёт списка ежедневно; вход/выход из universe логируется. |
 | 2 | Symbols universe (MOEX) | Весь индекс IMOEX (~40 тикеров). Состав обновляется при ребалансировке индекса (ежеквартально). |
 | 3 | Облигации scope | ОФЗ (все ликвидные выпуски) + корпоративные top-20 по обороту. Пересчёт top-20 ежемесячно. |
-| 4 | GPU | A100 / H100 (серверные). Позволяет обучать Transformer-модели средних размеров, ruBERT и FinBERT без ограничений. |
+| 4 | GPU / Compute | Локальная машина Apple M4. GPU (A100/H100) есть в облаке, но использование проблематично. Для большинства predicting-алгоритмов CPU достаточно. M4 Neural Engine / MPS — для inference NLP-моделей. |
 | 5 | Глубина истории | 3 года (MOEX с ~2023, крипта с ~2023). При необходимости — backfill глубже. |
 | 6 | Tinkoff API токен | Production (real-time данные, бесплатно). Получить в ЛК Тинькофф → Настройки → Токен для API. |
 | 7 | Вечерняя сессия MOEX | Отложена. Архитектура поддерживает, но v1 — только основная сессия (10:00–18:50 MSK). |
@@ -1279,8 +1313,11 @@ history_depth: 3 years
   1m_candles: last 6 months (storage optimization)
 
 # === INFRASTRUCTURE ===
-gpu: A100 / H100 (server-grade, 40-80GB VRAM)
-deployment: local server, Docker Compose
+compute:
+  local: Apple M4 (CPU + Neural Engine / MPS for inference)
+  cloud_gpu: A100/H100 available but problematic to use regularly
+  strategy: CPU-first for training (XGBoost/LightGBM), M4 MPS for NLP inference
+deployment: local server (M4 Mac), Docker Compose
 database: TimescaleDB (time-series) + PostgreSQL 16 (metadata) + Redis 7 (queue/cache)
 
 # === SENTIMENT ===
@@ -1294,6 +1331,8 @@ data_subscriptions: $0 (all free APIs)
 ---
 
 ## Appendix A: Deployment (Docker Compose)
+
+> **Note:** Deployment на Apple M4 Mac. Docker Desktop for Mac поддерживает ARM-native контейнеры. PyTorch MPS backend доступен **только** на хосте macOS (не внутри Docker). Для NLP inference с MPS-ускорением — запускать ml-pipeline вне Docker напрямую на хосте, или использовать CPU mode внутри контейнера (достаточно быстро для batch inference).
 
 ```yaml
 version: "3.8"
@@ -1355,11 +1394,8 @@ services:
   ml-pipeline:
     build: ./services/ml-pipeline
     depends_on: [timescaledb, redis]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
+    # CPU-first: XGBoost/LightGBM native; PyTorch MPS for NLP inference on macOS host
+    # На Linux (Docker) — PyTorch CPU mode для NLP inference
     restart: always
 
   signal-service:
